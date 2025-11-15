@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+import json, base64, ssl, logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+logging.basicConfig(level=logging.INFO)
+
+def admission_response(uid, allowed=True, patch=None, message=None):
+    resp = {
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "response": {
+            "uid": uid,
+            "allowed": allowed,
+        },
+    }
+    if patch is not None:
+        patch_b64 = base64.b64encode(json.dumps(patch).encode()).decode()
+        resp["response"]["patchType"] = "JSONPatch"
+        resp["response"]["patch"] = patch_b64
+    if message:
+        resp["response"]["status"] = {"message": message}
+    return resp
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        try:
+            review = json.loads(body)
+        except Exception as e:
+            logging.exception("Invalid JSON received")
+            self.send_response(400); self.end_headers(); return
+
+        uid = review.get("request", {}).get("uid", "")
+        obj = review.get("request", {}).get("object", {})
+
+        logging.info("AdmissionReview received: path=%s uid=%s kind=%s/%s",
+                     self.path, uid,
+                     review.get("request", {}).get("kind", {}).get("kind"),
+                     review.get("request", {}).get("resource", {}).get("resource"))
+
+        if self.path == "/mutate":
+            resp = self.handle_mutate(uid, obj)
+        elif self.path == "/validate":
+            resp = self.handle_validate(uid, obj)
+        else:
+            self.send_response(404); self.end_headers(); return
+
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def handle_mutate(self, uid, pod):
+        patches = []
+        spec = pod.get("spec", {})
+        # si /spec/securityContext absent -> add
+        if "securityContext" not in spec:
+            patches.append({
+                "op": "add",
+                "path": "/spec/securityContext",
+                "value": {"runAsNonRoot": True, "runAsUser": 1234}
+            })
+        # Example: ensure each container has securityContext? (optional)
+        # if any additional mutations needed, add ici
+
+        if patches:
+            logging.info("Mutate: returning %d patch(es)", len(patches))
+            return admission_response(uid, allowed=True, patch=patches)
+        logging.info("Mutate: no patch needed")
+        return admission_response(uid, allowed=True)
+
+    def handle_validate(self, uid, pod):
+        sc = pod.get("spec", {}).get("securityContext", {})
+        run_as_non_root = sc.get("runAsNonRoot", False)
+        run_as_user = sc.get("runAsUser", None)
+        if run_as_non_root and run_as_user == 0:
+            msg = "Invalid: runAsNonRoot=true but runAsUser=0"
+            logging.info("Validate: denying pod (%s)", msg)
+            return admission_response(uid, allowed=False, message=msg)
+        logging.info("Validate: allowed")
+        return admission_response(uid, allowed=True)
+
+def run():
+    server_address = ('0.0.0.0', 8443)
+    httpd = HTTPServer(server_address, WebhookHandler)
+    cert_file = "/run/secrets/tls/tls.crt"
+    key_file = "/run/secrets/tls/tls.key"
+    logging.info("Loading cert=%s key=%s", cert_file, key_file)
+
+    # Create SSL context
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    # Autoriser TLS1.2 et TLS1.3, obligatoire pour Kubernetes
+    # N'autoriser que TLS1.2/TLS1.3
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+   # context.maximum_version = ssl.TLSVersion.TLSv1_3
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+
+
+    logging.info("Starting webhook server on 0.0.0.0:8443")
+    httpd.serve_forever()
+
+if __name__ == "__main__":
+    run()
