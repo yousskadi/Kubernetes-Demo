@@ -38,11 +38,13 @@ on:
       - develop    # Chaque push sur develop (branche de développement)
     paths:
       - 'k8s-psa-lab/**'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches:
       - main       # Chaque PR qui cible main (avant le merge)
     paths:
       - 'k8s-psa-lab/**' 
+      - '.github/workflows/ci.yml'
 # ─────────────────────────────────────────────────────────────────────────
 # VARIABLES D'ENVIRONNEMENT GLOBALES
 # Accessibles dans tous les jobs via ${{ env.NOM_VARIABLE }}
