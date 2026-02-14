@@ -35,10 +35,13 @@ on:
     branches:
       - main       # Chaque push sur main (ex: merge d'une PR)
       - develop    # Chaque push sur develop (branche de développement)
+    paths:
+      - 'k8s-psa-lab/**'
   pull_request:
     branches:
       - main       # Chaque PR qui cible main (avant le merge)
-
+    paths:
+      - 'k8s-psa-lab/**' 
 # ─────────────────────────────────────────────────────────────────────────
 # VARIABLES D'ENVIRONNEMENT GLOBALES
 # Accessibles dans tous les jobs via ${{ env.NOM_VARIABLE }}
@@ -50,6 +53,7 @@ env:
   # Nom unique par run pour éviter les conflits si plusieurs pipelines tournent en parallèle
   # github.run_id est un entier unique généré par GitHub pour chaque exécution
   CLUSTER_NAME: psa-ci-${{ github.run_id }}
+  WORKDIR: k8s-psa-lab
 
 # ═══════════════════════════════════════════════════════════════════════════
 # JOB 1 : LINT
@@ -57,6 +61,9 @@ env:
 #            AVANT de créer un cluster (rapide et peu coûteux)
 # Durée estimée : ~30 secondes
 # ═══════════════════════════════════════════════════════════════════════════
+defaults:
+  run:
+    working-directory: k8s-psa-lab
 jobs:
   lint:
     name: "Lint YAML & Helm"
@@ -148,7 +155,7 @@ jobs:
         with:
           version: ${{ env.KIND_VERSION }}
           cluster_name: ${{ env.CLUSTER_NAME }}
-          config: kind/cluster-simple.yaml
+          config: ${{ env.WORKDIR }}/kind/cluster-simple.yaml
           kubectl_version: ${{ env.KUBECTL_VERSION }}
           wait: 120s
 
