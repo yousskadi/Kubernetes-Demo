@@ -1,140 +1,313 @@
+# ═══════════════════════════════════════════════════════════════════════════
 # .github/workflows/ci.yml
-# Pipeline CI GitHub Actions pour le lab PSA
-# Déclenché sur chaque push et pull request
+#
+# FONCTIONNEMENT GÉNÉRAL :
+#
+#   Chaque push ou PR déclenche ce pipeline composé de 3 jobs exécutés
+#   dans l'ordre suivant (grâce au mot-clé "needs") :
+#
+#   ┌─────────┐     ┌────────────────────┐     ┌──────────────────┐
+#   │  lint   │────▶│ integration-tests  │────▶│ compliance-report│
+#   └─────────┘     └────────────────────┘     └──────────────────┘
+#
+#   Si "lint" échoue → "integration-tests" ne démarre pas
+#   Si "integration-tests" échoue → "compliance-report" ne démarre pas
+#
+# POURQUOI KIND FONCTIONNE SUR GITHUB ACTIONS SANS CONFIGURATION SPÉCIALE :
+#
+#   GitHub Actions fournit une VM Ubuntu dédiée par job (runs-on: ubuntu-latest)
+#   Cette VM a Docker pré-installé et configuré.
+#   Kind crée ses "nœuds" Kubernetes sous forme de containers Docker directement
+#   sur cette VM → pas besoin de Docker-in-Docker (DinD) ni de privileged mode.
+#
+#   Contrairement à GitLab CI où le job tourne dans un container,
+#   ici le job tourne dans une vraie VM → Docker est disponible nativement.
+#
+# ═══════════════════════════════════════════════════════════════════════════
 name: PSA Lab CI
 
+# ─────────────────────────────────────────────────────────────────────────
+# DÉCLENCHEURS
+# Le pipeline se lance automatiquement dans ces situations :
+# ─────────────────────────────────────────────────────────────────────────
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - main       # Chaque push sur main (ex: merge d'une PR)
+      - develop    # Chaque push sur develop (branche de développement)
   pull_request:
-    branches: [main]
+    branches:
+      - main       # Chaque PR qui cible main (avant le merge)
 
+# ─────────────────────────────────────────────────────────────────────────
+# VARIABLES D'ENVIRONNEMENT GLOBALES
+# Accessibles dans tous les jobs via ${{ env.NOM_VARIABLE }}
+# Centralisées ici pour faciliter les mises à jour de version
+# ─────────────────────────────────────────────────────────────────────────
 env:
-  KIND_VERSION: v0.20.0
-  KUBECTL_VERSION: v1.28.0
+  KIND_VERSION: v0.20.0       # Version de Kind à installer sur la VM
+  KUBECTL_VERSION: v1.28.0    # Version de kubectl (doit correspondre au cluster)
+  # Nom unique par run pour éviter les conflits si plusieurs pipelines tournent en parallèle
+  # github.run_id est un entier unique généré par GitHub pour chaque exécution
   CLUSTER_NAME: psa-ci-${{ github.run_id }}
 
+# ═══════════════════════════════════════════════════════════════════════════
+# JOB 1 : LINT
+# Objectif : vérifier la syntaxe des fichiers YAML et du chart Helm
+#            AVANT de créer un cluster (rapide et peu coûteux)
+# Durée estimée : ~30 secondes
+# ═══════════════════════════════════════════════════════════════════════════
 jobs:
-  # ────────────────────────────────────────────────────────────────
-  # Job 1 : Lint des manifests YAML
-  # ────────────────────────────────────────────────────────────────
   lint:
-    name: "Lint YAML Manifests"
-    runs-on: ubuntu-latest
+    name: "Lint YAML & Helm"
+    runs-on: ubuntu-latest   # VM Ubuntu fournie par GitHub (2 CPU, 7 Go RAM)
+
     steps:
+      # ── Récupérer le code du repo ────────────────────────────────────────
+      # actions/checkout est l'action officielle GitHub pour cloner le repo
+      # dans le workspace de la VM (/home/runner/work/<repo>/<repo>)
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Installer yamllint ───────────────────────────────────────────────
+      # yamllint est un linter Python pour la syntaxe YAML
+      # Il détecte les erreurs d'indentation, les tabulations, etc.
       - name: Install yamllint
         run: pip install yamllint
 
+      # ── Linter les fichiers YAML ─────────────────────────────────────────
+      # -d relaxed : mode permissif (pas de règles strictes sur la longueur des lignes)
+      # || true : ne pas faire échouer le job sur les warnings (non-bloquant)
+      # On lint manifests/ et kind/ mais pas helm/ (templates Helm contiennent {{ }})
       - name: Lint YAML
-        run: |
-          yamllint -d relaxed manifests/ kind/ || true
+        run: yamllint -d relaxed manifests/ kind/ || true
 
-      - name: Install kubeval
-        run: |
-          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
-          tar xf kubeval-linux-amd64.tar.gz
-          sudo mv kubeval /usr/local/bin/
-
-      - name: Validate Kubernetes manifests
-        run: |
-          find manifests/ -name '*.yaml' | xargs kubeval \
-            --kubernetes-version 1.28.0 \
-            --ignore-missing-schemas || true
-
-      - name: Lint Helm chart
-        uses: helm/chart-testing-action@v2
+      # ── Installer Helm ───────────────────────────────────────────────────
+      # azure/setup-helm est l'action recommandée pour installer Helm sur la VM
+      # On fixe la version pour éviter les surprises lors des mises à jour
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
         with:
-          command: lint
-          config: ct.yaml
-        continue-on-error: true
+          version: v3.13.0
 
-  # ────────────────────────────────────────────────────────────────
-  # Job 2 : Tests d'intégration avec Kind
-  # ────────────────────────────────────────────────────────────────
+      # ── Linter le chart Helm ─────────────────────────────────────────────
+      # helm lint vérifie la structure du chart :
+      #   - Chart.yaml valide
+      #   - templates syntaxiquement corrects
+      #   - values.yaml cohérent
+      # --strict : traiter les warnings comme des erreurs (plus rigoureux)
+      - name: Lint Helm chart
+        run: |
+          helm lint ./helm/psa-namespace --strict
+          echo "✅ Helm lint OK"
+
+      # ── Tester le rendu des templates Helm ──────────────────────────────
+      # helm template génère les manifests YAML finaux sans les appliquer
+      # Cela vérifie que les templates se rendent correctement avec des valeurs
+      # C'est différent de helm lint : ici on teste le rendu réel
+      - name: Helm template dry-run
+        run: |
+          helm template test-ns ./helm/psa-namespace \
+            --set namespaceName=helm-test \
+            --set podSecurity.enforce=restricted \
+            --set podSecurity.version=v1.28
+          echo "✅ Helm template OK"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 : TESTS D'INTÉGRATION
+  # Objectif : créer un vrai cluster Kubernetes avec Kind et exécuter
+  #            les tests PSA pour valider que tout fonctionne end-to-end
+  # Durée estimée : ~3-4 minutes (la majorité en création du cluster)
+  # Dépendance : attend que "lint" réussisse avant de démarrer
+  # ═══════════════════════════════════════════════════════════════════════════
   integration-tests:
-    name: "PSA Integration Tests"
+    name: "PSA Integration Tests (Kind)"
     runs-on: ubuntu-latest
-    needs: lint
+    needs: lint   # ← Ce job ne démarre QUE si "lint" a réussi (exit 0)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Kind
+      # ── Créer le cluster Kind ────────────────────────────────────────────
+      # helm/kind-action est l'action officielle pour Kind sur GitHub Actions
+      # Elle :
+      #   1. Télécharge et installe Kind (version spécifiée)
+      #   2. Télécharge et installe kubectl (version spécifiée)
+      #   3. Crée le cluster avec la config fournie
+      #   4. Configure automatiquement le kubeconfig pour que kubectl fonctionne
+      #
+      # config: kind/cluster-simple.yaml → 1 seul nœud (plus rapide en CI)
+      #   On n'utilise pas cluster-multinode.yaml pour économiser du temps CI
+      #
+      # wait: 120s → attendre jusqu'à 2 minutes que les nœuds soient Ready
+      #   Sans ce paramètre, les étapes suivantes pourraient échouer car
+      #   les pods système (coredns, etc.) ne seraient pas encore démarrés
+      - name: Setup Kind + kubectl
         uses: helm/kind-action@v1
         with:
           version: ${{ env.KIND_VERSION }}
           cluster_name: ${{ env.CLUSTER_NAME }}
           config: kind/cluster-simple.yaml
           kubectl_version: ${{ env.KUBECTL_VERSION }}
+          wait: 120s
 
-      - name: Verify cluster
+      # ── Vérifier que le cluster répond ──────────────────────────────────
+      # Étape de diagnostic : si quelque chose se passe mal plus tard,
+      # ces infos dans les logs aident à comprendre l'état du cluster
+      # --context kind-<nom> : être explicite sur quel cluster on parle
+      #   (utile si plusieurs kubeconfigs sont présents)
+      - name: Verify cluster is ready
         run: |
-          kubectl cluster-info
-          kubectl get nodes
-          kubectl get pods -A
+          kubectl cluster-info --context kind-${{ env.CLUSTER_NAME }}
+          kubectl get nodes -o wide
+          kubectl get pods -A   # Vérifier que les pods système tournent
 
+      # ── Installer jq ─────────────────────────────────────────────────────
+      # jq est un outil de parsing JSON utilisé dans nos scripts bash
+      # (audit-namespaces.sh et check-compliance.sh l'utilisent)
+      # Il est pré-installé sur les runners GitHub mais on s'assure qu'il est là
       - name: Install jq
         run: sudo apt-get install -y jq
 
+      # ── Rendre les scripts exécutables ──────────────────────────────────
+      # Git ne préserve pas toujours les permissions +x sur les fichiers
+      # Cette étape garantit que tous les scripts .sh sont exécutables
       - name: Make scripts executable
         run: chmod +x scripts/*.sh tests/*.sh
 
+      # ── Tests Lab 1 : Profil Privileged ─────────────────────────────────
+      # Vérifie que :
+      #   - le namespace monitoring-privileged a les bons labels PSA
+      #   - les workloads avec hostNetwork/hostPID sont acceptés
+      #   - l'exception est documentée via annotations
+      - name: Run Lab 1 tests (Privileged)
+        run: ./tests/test-lab1-privileged.sh
+
+      # ── Tests Lab 2 : Profil Baseline ───────────────────────────────────
+      # Vérifie que :
+      #   - le namespace app-baseline a enforce=baseline
+      #   - les pods conformes sont créés
+      #   - les pods avec hostNetwork sont REFUSÉS
+      #   - les warnings restricted s'affichent bien
       - name: Run Lab 2 tests (Baseline)
         run: ./tests/test-lab2-baseline.sh
 
+      # ── Tests Lab 3 : Profil Restricted ─────────────────────────────────
+      # Vérifie que :
+      #   - le namespace app-restricted a enforce=restricted
+      #   - les pods sans seccomp/capabilities/runAsNonRoot sont REFUSÉS
+      #   - les pods correctement configurés sont créés
+      #   - les champs de sécurité sont bien présents dans le pod créé
       - name: Run Lab 3 tests (Restricted)
         run: ./tests/test-lab3-restricted.sh
 
-      - name: Audit namespaces
+      # ── Rapport d'audit des namespaces ──────────────────────────────────
+      # Affiche un tableau récapitulatif de tous les namespaces
+      # avec leurs politiques PSA enforce/audit/warn
+      # Utile pour avoir une vue d'ensemble dans les logs CI
+      - name: Audit all namespaces
         run: ./scripts/audit-namespaces.sh
 
-      - name: Validate production manifests dry-run
+      # ── Dry-run server-side de tous les namespaces ───────────────────────
+      # --server-side : la validation se fait côté API server (plus précise)
+      # --dry-run=server : simule l'apply sans rien créer/modifier
+      # Cela détecte les erreurs que le client-side dry-run ne verrait pas
+      # (ex: conflits, validations webhooks, etc.)
+      - name: Dry-run namespaces server-side
         run: |
           kubectl apply -f manifests/00-namespaces/ --server-side --dry-run=server
-          echo "✅ Dry-run production manifests OK"
+          echo "✅ Dry-run namespaces OK"
 
-      - name: Test Helm chart dry-run
+      # ── Installer Helm pour le dry-run ──────────────────────────────────
+      # Helm n'est pas partagé entre les jobs (chaque job a sa propre VM)
+      # Il faut le réinstaller dans ce job
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.13.0
+
+      # ── Tester le chart Helm contre un vrai cluster ──────────────────────
+      # helm install --dry-run --debug contre un vrai cluster (pas juste template)
+      # Cela vérifie que Helm peut communiquer avec l'API server
+      # et que les ressources générées sont valides selon Kubernetes
+      # --debug : affiche le manifest YAML généré dans les logs (pratique)
+      - name: Helm install dry-run
         run: |
           helm install test-ns ./helm/psa-namespace \
             --set namespaceName=helm-test \
             --set podSecurity.enforce=restricted \
-            --dry-run
-          echo "✅ Helm chart dry-run OK"
+            --set podSecurity.version=v1.28 \
+            --dry-run --debug
+          echo "✅ Helm dry-run OK"
 
-      - name: Upload test results
-        if: always()
+      # ── Collecter les logs en cas d'échec ────────────────────────────────
+      # if: failure() → cette étape ne s'exécute QUE si une étape précédente
+      #   a échoué (exit code != 0)
+      # Les logs Kind sont utiles pour diagnostiquer les problèmes de cluster
+      # L'artifact est disponible dans l'onglet "Summary" du workflow pendant 3 jours
+      - name: Upload logs si échec
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ github.run_id }}
-          path: |
-            /tmp/psa-test-*.log
-          retention-days: 7
+          name: kind-logs-${{ github.run_id }}
+          path: /tmp/kind-logs/
+          retention-days: 3
 
-  # ────────────────────────────────────────────────────────────────
-  # Job 3 : Rapport de conformité
-  # ────────────────────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3 : RAPPORT DE CONFORMITÉ
+  # Objectif : générer un tableau récapitulatif visible dans l'onglet
+  #            "Summary" du workflow sur GitHub (pas dans les logs)
+  # Durée estimée : ~10 secondes
+  # Condition : uniquement sur la branche main (pas sur les PR)
+  #             car c'est un rapport "officiel" de l'état de la branche stable
+  # ═══════════════════════════════════════════════════════════════════════════
   compliance-report:
     name: "Compliance Report"
     runs-on: ubuntu-latest
-    needs: integration-tests
+    needs: integration-tests   # ← Attend que les tests passent
+
+    # if: github.ref == 'refs/heads/main'
+    # Ce job ne tourne PAS sur les PR, seulement après merge sur main
+    # Sur une PR, refs/heads/main ne correspond pas (c'est refs/pull/N/merge)
     if: github.ref == 'refs/heads/main'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Générer le rapport de conformité ────────────────────────────────
+      # $GITHUB_STEP_SUMMARY est une variable GitHub Actions qui pointe vers
+      # un fichier Markdown spécial : tout ce qu'on écrit dedans apparaît
+      # dans l'onglet "Summary" du workflow (interface graphique GitHub)
+      # C'est différent des logs : c'est mis en forme et mis en avant
+      #
+      # Le script :
+      #   1. Parse chaque fichier YAML de manifests/00-namespaces/
+      #   2. Extrait les labels PSA avec grep + awk
+      #   3. Ajoute un emoji selon le niveau (🟢 restricted, 🟡 baseline, 🔴 privileged)
+      #   4. Construit un tableau Markdown
       - name: Generate compliance summary
         run: |
-          echo "## PSA Compliance Report" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔐 PSA Compliance Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Namespace | Enforce | Audit | Warn |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|---------|-------|------|" >> $GITHUB_STEP_SUMMARY
-          find manifests/00-namespaces/ -name '*.yaml' | while read f; do
+          echo "|-----------|:-------:|:-----:|:----:|" >> $GITHUB_STEP_SUMMARY
+          find manifests/00-namespaces/ -name '*.yaml' | sort | while read f; do
             NS=$(grep "name:" "$f" | head -1 | awk '{print $2}')
-            ENF=$(grep "enforce:" "$f" | head -1 | awk '{print $2}')
-            AUD=$(grep "audit:" "$f" | grep -v "audit-version" | head -1 | awk '{print $2}')
-            WRN=$(grep "warn:" "$f" | grep -v "warn-version" | head -1 | awk '{print $2}')
-            echo "| $NS | ${ENF:-N/A} | ${AUD:-N/A} | ${WRN:-N/A} |" >> $GITHUB_STEP_SUMMARY
+            ENF=$(grep "enforce:" "$f" | grep -v "version" | head -1 | awk '{print $2}' || echo "N/A")
+            AUD=$(grep "audit:" "$f" | grep -v "version" | head -1 | awk '{print $2}' || echo "N/A")
+            WRN=$(grep "warn:" "$f" | grep -v "version" | head -1 | awk '{print $2}' || echo "N/A")
+            case "$ENF" in
+              restricted)  ICON="🟢" ;;
+              baseline)    ICON="🟡" ;;
+              privileged)  ICON="🔴" ;;
+              *)           ICON="⚪" ;;
+            esac
+            echo "| \`$NS\` | $ICON $ENF | $AUD | $WRN |" >> $GITHUB_STEP_SUMMARY
           done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Pipeline complet — tous les tests ont passé" >> $GITHUB_STEP_SUMMARY
