@@ -1,0 +1,140 @@
+# .github/workflows/ci.yml
+# Pipeline CI GitHub Actions pour le lab PSA
+# Déclenché sur chaque push et pull request
+name: PSA Lab CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  KIND_VERSION: v0.20.0
+  KUBECTL_VERSION: v1.28.0
+  CLUSTER_NAME: psa-ci-${{ github.run_id }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Job 1 : Lint des manifests YAML
+  # ────────────────────────────────────────────────────────────────
+  lint:
+    name: "Lint YAML Manifests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint YAML
+        run: |
+          yamllint -d relaxed manifests/ kind/ || true
+
+      - name: Install kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin/
+
+      - name: Validate Kubernetes manifests
+        run: |
+          find manifests/ -name '*.yaml' | xargs kubeval \
+            --kubernetes-version 1.28.0 \
+            --ignore-missing-schemas || true
+
+      - name: Lint Helm chart
+        uses: helm/chart-testing-action@v2
+        with:
+          command: lint
+          config: ct.yaml
+        continue-on-error: true
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 2 : Tests d'intégration avec Kind
+  # ────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: "PSA Integration Tests"
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Kind
+        uses: helm/kind-action@v1
+        with:
+          version: ${{ env.KIND_VERSION }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          config: kind/cluster-simple.yaml
+          kubectl_version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Verify cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get pods -A
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh tests/*.sh
+
+      - name: Run Lab 2 tests (Baseline)
+        run: ./tests/test-lab2-baseline.sh
+
+      - name: Run Lab 3 tests (Restricted)
+        run: ./tests/test-lab3-restricted.sh
+
+      - name: Audit namespaces
+        run: ./scripts/audit-namespaces.sh
+
+      - name: Validate production manifests dry-run
+        run: |
+          kubectl apply -f manifests/00-namespaces/ --server-side --dry-run=server
+          echo "✅ Dry-run production manifests OK"
+
+      - name: Test Helm chart dry-run
+        run: |
+          helm install test-ns ./helm/psa-namespace \
+            --set namespaceName=helm-test \
+            --set podSecurity.enforce=restricted \
+            --dry-run
+          echo "✅ Helm chart dry-run OK"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            /tmp/psa-test-*.log
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 3 : Rapport de conformité
+  # ────────────────────────────────────────────────────────────────
+  compliance-report:
+    name: "Compliance Report"
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate compliance summary
+        run: |
+          echo "## PSA Compliance Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | Enforce | Audit | Warn |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|-------|------|" >> $GITHUB_STEP_SUMMARY
+          find manifests/00-namespaces/ -name '*.yaml' | while read f; do
+            NS=$(grep "name:" "$f" | head -1 | awk '{print $2}')
+            ENF=$(grep "enforce:" "$f" | head -1 | awk '{print $2}')
+            AUD=$(grep "audit:" "$f" | grep -v "audit-version" | head -1 | awk '{print $2}')
+            WRN=$(grep "warn:" "$f" | grep -v "warn-version" | head -1 | awk '{print $2}')
+            echo "| $NS | ${ENF:-N/A} | ${AUD:-N/A} | ${WRN:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          done
