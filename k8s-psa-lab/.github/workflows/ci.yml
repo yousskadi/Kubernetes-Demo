@@ -31,6 +31,7 @@ name: PSA Lab CI
 # Le pipeline se lance automatiquement dans ces situations :
 # ─────────────────────────────────────────────────────────────────────────
 on:
+  workflow_dispatch:
   push:
     branches:
       - main       # Chaque push sur main (ex: merge d'une PR)
